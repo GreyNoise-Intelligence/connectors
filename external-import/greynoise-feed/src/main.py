@@ -44,6 +44,13 @@ class GreyNoiseFeed:
             isNumber=True,
             default=75,
         )
+        self.indicator_score_suspicious = get_config_variable(
+            "GREYNOISE_INDICATOR_SCORE_SUSPICIOUS",
+            ["greynoisefeed", "indicator_score_suspicious"],
+            config,
+            isNumber=True,
+            default=50,
+        )
         self.indicator_score_benign = get_config_variable(
             "GREYNOISE_INDICATOR_SCORE_BENIGN",
             ["greynoisefeed", "indicator_score_benign"],
@@ -87,6 +94,9 @@ class GreyNoiseFeed:
             type="Organization",
             name=self.greynoise_ent_name,
             description=self.greynoise_ent_desc,
+            custom_properties={
+                "x_opencti_reliability": "B - Usually reliable",
+                "x_opencti_organization_type": "vendor"}
         )
 
         # Cache for label
@@ -94,56 +104,72 @@ class GreyNoiseFeed:
 
     def get_feed_query(self, feed_type):
         query = ""
-        if feed_type.lower() not in ["benign", "malicious", "benign+malicious", "all"]:
+        if feed_type.lower() not in ["benign", "malicious", "suspicious", "benign+malicious",
+                                     "benign+suspicious+malicious", "malicious+suspicious", "all"]:
             self.helper.log_error(
-                "Value for feed_type is not one of: benign, malicious, or all"
+                "Value for feed_type is not valid.  Valid options are: benign, malicious, suspicious, "
+                "benign+malicious, benign+suspicious+malicious, malicious+suspicious, all"
             )
             exit(1)
         elif feed_type.lower() == "benign":
             query = "last_seen:1d classification:benign"
         elif feed_type.lower() == "malicious":
             query = "last_seen:1d classification:malicious"
+        elif feed_type.lower() == "suspicious":
+            query = "last_seen:1d classification:suspicious"
         elif feed_type.lower() == "benign+malicious":
             query = "last_seen:1d (classification:malicious OR classification:benign)"
+        elif feed_type.lower() == "malicious+suspicious":
+            query = "last_seen:1d (classification:malicious OR classification:suspicious)"
+        elif feed_type.lower() == "benign+suspicious+malicious":
+            query = "last_seen:1d (-classification:unknown)"
         elif feed_type.lower() == "all":
             query = "last_seen:1d"
 
         return query
 
-    def _process_labels(self, data: dict, data_tags: dict) -> tuple:
+    def _process_labels(self, indicator_data: dict, data_tags: dict) -> tuple:
         """
         This method allows you to start the process of creating labels and recovering associated malware.
 
-        :param data: A parameter that contains all the data about the IPv4 that was searched for in GreyNoise.
+        :param indicator_data: A parameter that contains all the data about the IPv4 that was searched for in GreyNoise.
         :param data_tags: A parameter that contains all the data relating to the existing tags in GreyNoise
         :return: A tuple (all labels, all malwares)
         """
 
         self.all_labels = []
         all_malwares = []
-        entity_tags = data["tags"]
+        entity_tags = indicator_data["tags"]
 
-        if data["classification"] == "benign":
+        if indicator_data["classification"] == "benign":
             # Create label GreyNoise "benign"
-            self._create_custom_label("gn-classification: benign", "#06c93a")
+            self.all_labels.append("gn-classification: benign")
             # Include additional label "benign-actor"
             self._create_custom_label(f"gn-benign-actor: {data['actor']} ", "#06c93a")
 
-        elif data["classification"] == "unknown":
+        elif indicator_data["classification"] == "unknown":
             # Create label GreyNoise "unknown"
-            self._create_custom_label("gn-classification: unknown", "#a6a09f")
+            self.all_labels.append("gn-classification: unknown")
 
-        elif data["classification"] == "malicious":
+        elif indicator_data["classification"] == "malicious":
             # Create label GreyNoise "malicious"
-            self._create_custom_label("gn-classification: malicious", "#ff8178")
+            self.all_labels.append("gn-classification: malicious")
 
-        if data["bot"] is True:
+        elif indicator_data["classification"] == "suspicious":
+            # Create label GreyNoise "malicious"
+            self.all_labels.append("gn-classification: suspicious")
+
+        if indicator_data["bot"] is True:
             # Create label for "Known Bot Activity"
-            self._create_custom_label("Known BOT Activity", "#7e4ec2")
+            self.all_labels.append("Known BOT Activity")
 
-        if data["metadata"]["tor"] is True:
+        if indicator_data["vpn"] is True:
+            # Create label for "Known VPN"
+            self.all_labels.append("Known VPN")
+
+        if indicator_data["metadata"]["tor"] is True:
             # Create label for "Known Tor Exit Node"
-            self._create_custom_label("Known TOR Exit Node", "#7e4ec2")
+            self.all_labels.append("Known TOR Exit Node")
 
         # Create all Labels in entity_tags
         for tag in entity_tags:
@@ -151,22 +177,11 @@ class GreyNoiseFeed:
             if tag_details_matching is not None:
                 tag_details = tag_details_matching
             else:
-                self.helper.connector_logger.info(
-                    "[CONNECTOR] The tag was created, but its details were not correctly recognized by GreyNoise,"
-                    " which is often related to a name problem.",
-                    {"Tag_name": tag},
-                )
-                self.all_labels.append(tag)
+                # Drop tags from an indicator that are no longer in tag library
                 continue
 
-            # Create red label when malicious intent and type not category worm and activity
-            if tag_details["intention"] == "malicious" and tag_details[
-                "category"
-            ] not in ["worm", "activity"]:
-                self._create_custom_label(f"{tag}", "#ff8178")
-
             # If category is worm, prepare malware object
-            elif tag_details["category"] == "worm":
+            if tag_details["category"] == "worm":
                 malware_worm = {
                     "name": f"{tag}",
                     "description": f"{tag_details['description']}",
@@ -177,8 +192,8 @@ class GreyNoiseFeed:
 
             # If category is malicious and activity, prepare malware object
             elif (
-                tag_details["intention"] == "malicious"
-                and tag_details["category"] == "activity"
+                    tag_details["intention"] == "malicious"
+                    and tag_details["category"] == "activity"
             ):
                 malware_malicious_activity = {
                     "name": f"{tag}",
@@ -190,7 +205,62 @@ class GreyNoiseFeed:
 
             else:
                 # Create white label otherwise
-                self._create_custom_label(f"{tag}", "#ffffff")
+                self.all_labels.append(tag)
+
+        return self.all_labels, all_malwares
+
+    def _process_gn_tags(self, data_tags: dict) -> tuple:
+        """
+        This method allows you to start the process of creating labels and recovering associated malware.
+
+        :param data_tags: A parameter that contains all the data relating to the existing tags in GreyNoise
+        :return: A tuple (all labels, all malwares)
+        """
+
+        self.all_labels = []
+        all_malwares = []
+
+        # Create label GreyNoise "benign"
+        self._create_custom_label("gn-classification: benign", "#06c93a")
+        # Create label GreyNoise "unknown"
+        self._create_custom_label("gn-classification: unknown", "#a6a09f")
+        # Create label GreyNoise "malicious"
+        self._create_custom_label("gn-classification: malicious", "#ff8178")
+        # Create label GreyNoise "malicious"
+        self._create_custom_label("gn-classification: suspicious", "#e3d922")
+        # Create label for "Known Bot Activity"
+        self._create_custom_label("Known BOT Activity", "#7e4ec2")
+        # Create label for "Known VPN"
+        self._create_custom_label("Known VPN", "#7e4ec2")
+        # Create label for "Known Tor Exit Node"
+        self._create_custom_label("Known TOR Exit Node", "#7e4ec2")
+
+        # Create all Labels in entity_tags
+        for tag in data_tags["metadata"]:
+            # Create red label when malicious intent and type not category worm and activity
+            if tag["intention"] == "malicious" and tag[
+                "category"
+            ] not in ["worm"]:
+                self._create_custom_label(f"{tag['name']}", "#ff8178")
+
+            # If category is worm, prepare malware object
+            elif tag["category"] == "worm":
+                malware_worm = {
+                    "name": f"{tag['name']}",
+                    "description": f"{tag['description']}",
+                    "type": "worm",
+                }
+                all_malwares.append(malware_worm)
+                self.all_labels.append(tag['name'])
+
+            elif tag["intention"] == "benign":
+                self._create_custom_label(f"{tag['name']}", "#06c93a")
+            elif tag["intention"] == "suspicious":
+                self._create_custom_label(f"{tag['name']}", "#e3d922")
+
+            else:
+                # Create white label otherwise
+                self._create_custom_label(f"{tag['name']}", "#ffffff")
 
         return self.all_labels, all_malwares
 
@@ -223,19 +293,30 @@ class GreyNoiseFeed:
     def _get_match(data, key, value):
         return next((x for x in data if x[key] == value), None)
 
+    def _get_indicator_score(self, classification):
+        if classification == "malicious":
+            score = self.indicator_score_malicious
+        elif classification == "suspicious":
+            score = self.indicator_score_suspicious
+        else:
+            score = self.indicator_score_benign
+
+        return score
+
     def _process_data(self, work_id, session, ips_list):
         bundle_entities = []
         bundle_relationships = []
         json_data_tags = session.metadata()
+        self.all_gn_tags, self.all_gn_malware = self._process_gn_tags(json_data_tags)
         self.helper.log_info("Building Indicator Bundles")
         for ip in ips_list:
             if "ip" not in ip or "classification" not in ip:
                 continue
 
             description = (
-                "Internet Scanning IP detected by GreyNoise with classification `"
-                + ip["classification"]
-                + "`."
+                    "Internet Scanning IP detected by GreyNoise with classification `"
+                    + ip["classification"]
+                    + "`."
             )
             pattern = "[ipv4-addr:value = '" + ip["ip"] + "']"
 
@@ -270,9 +351,7 @@ class GreyNoiseFeed:
                 created=first_seen,
                 custom_properties={
                     "x_opencti_score": (
-                        self.indicator_score_malicious
-                        if ip["classification"] == "malicious"
-                        else self.indicator_score_benign
+                        self._get_indicator_score(ip["classification"])
                     ),
                     "x_opencti_main_observable_type": "IPv4-Addr",
                 },
@@ -408,6 +487,7 @@ class GreyNoiseFeed:
                                 object_marking_refs=[stix2.TLP_WHITE],
                             )
                             bundle_relationships.append(stix_relationship_observable_as)
+
                         except:
                             pass
                     if "organization" in metadata:
@@ -430,9 +510,7 @@ class GreyNoiseFeed:
                             created_by_ref=self.identity["standard_id"],
                             object_marking_refs=[stix2.TLP_WHITE],
                         )
-                        bundle_relationships.append(
-                            stix_relationship_observable_organization
-                        )
+                        bundle_relationships.append(stix_relationship_observable_organization)
 
                         if stix_as is not None:
                             stix_relationship_as_organization = stix2.Relationship(
@@ -445,9 +523,7 @@ class GreyNoiseFeed:
                                 created_by_ref=self.identity["standard_id"],
                                 object_marking_refs=[stix2.TLP_WHITE],
                             )
-                            bundle_relationships.append(
-                                stix_relationship_as_organization
-                            )
+                            bundle_relationships.append(stix_relationship_as_organization)
                     stix_city = None
                     if "city" in metadata:
                         stix_city = stix2.Location(
@@ -494,9 +570,7 @@ class GreyNoiseFeed:
                                 created_by_ref=self.identity["standard_id"],
                                 object_marking_refs=[stix2.TLP_WHITE],
                             )
-                            bundle_relationships.append(
-                                stix_relationship_observable_city
-                            )
+                            bundle_relationships.append(stix_relationship_observable_city)
                         else:
                             stix_relationship_city_country = stix2.Relationship(
                                 id=StixCoreRelationship.generate_id(
@@ -572,7 +646,7 @@ class GreyNoiseFeed:
                 x = i
                 self.helper.log_info("Creating Bundles")
                 bundle = self.helper.stix2_create_bundle(
-                    bundle_objects[x : x + batch_size]
+                    bundle_objects[x: x + batch_size]
                 )
                 self.helper.log_info("Submitting Bundles")
                 self.helper.send_stix2_bundle(
@@ -618,7 +692,7 @@ class GreyNoiseFeed:
                 try:
                     ips_list = []
                     session = GreyNoise(
-                        api_key=self.api_key, integration_name="opencti-feed-v2.4"
+                        api_key=self.api_key, integration_name="opencti-feed-v2.5"
                     )
 
                     query = self.get_feed_query(self.feed_type)
@@ -633,6 +707,10 @@ class GreyNoiseFeed:
                     if "data" in response and len(response["data"]) > 0:
                         for ip in response["data"]:
                             ips_list.append(ip)
+
+                    if len(ips_list) > self.greynoise_limit:
+                        complete = True
+                        ips_list = ips_list[0:self.greynoise_limit]
 
                     while not complete:
                         self.helper.log_info(
@@ -651,6 +729,7 @@ class GreyNoiseFeed:
 
                             if len(ips_list) > self.greynoise_limit:
                                 complete = True
+                                ips_list = ips_list[0:self.greynoise_limit]
 
                     self.helper.log_info("Query GreyNoise API - Completed")
                     self.helper.log_info(
@@ -659,17 +738,17 @@ class GreyNoiseFeed:
 
                     # Process
                     friendly_name = (
-                        "GreyNoise Feed connector run ("
-                        + str(self.greynoise_limit)
-                        + " IPs)"
+                            "GreyNoise Feed connector run ("
+                            + str(self.greynoise_limit)
+                            + " IPs)"
                     )
                     work_id = self.helper.api.work.initiate_work(
                         self.helper.connect_id, friendly_name
                     )
                     self._process_data(work_id, session, ips_list)
                     message = (
-                        "Connector successfully run, storing last_run_timestamp as "
-                        + now.astimezone(pytz.UTC).isoformat()
+                            "Connector successfully run, storing last_run_timestamp as "
+                            + now.astimezone(pytz.UTC).isoformat()
                     )
                     self.helper.api.work.to_processed(work_id, message)
                     self.helper.log_info(message)
